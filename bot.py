@@ -52,9 +52,7 @@ class AdminProductForm(StatesGroup):
     waiting_for_photo = State()
     waiting_for_description = State()
 
-# ---------- FSM для отчётов ----------
 class ReportForm(StatesGroup):
-    waiting_for_period = State()
     waiting_for_custom_start = State()
     waiting_for_custom_end = State()
 
@@ -180,7 +178,7 @@ def admin_keyboard():
         [InlineKeyboardButton(text="📦 Товары", callback_data="admin_products")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="📈 Отчёты", callback_data="admin_reports")],  # Новая кнопка
+        [InlineKeyboardButton(text="📈 Отчёты", callback_data="admin_reports")],
     ])
 
 def confirm_keyboard():
@@ -683,7 +681,7 @@ async def admin_edit_price_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminProductForm.waiting_for_price)
     await callback.answer()
 
-# ---------- Статистика (базовая) ----------
+# ---------- Статистика ----------
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -704,7 +702,7 @@ async def admin_stats(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_kb())
     await callback.answer()
 
-# ---------- НОВЫЙ РАЗДЕЛ: ОТЧЁТЫ ----------
+# ---------- ОТЧЁТЫ (ИСПРАВЛЕННЫЕ) ----------
 @dp.callback_query(F.data == "admin_reports")
 async def admin_reports_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -717,81 +715,84 @@ async def admin_reports_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ---- Отчёт за период ----
 async def generate_report(callback: CallbackQuery, start_date, end_date, period_name):
-    async with db_pool.acquire() as conn:
-        # Общие показатели
-        total_orders = await conn.fetchval(
-            "SELECT COUNT(*) FROM orders WHERE created_at >= $1 AND created_at < $2",
-            start_date, end_date
-        )
-        total_revenue = await conn.fetchval(
-            "SELECT COALESCE(SUM(total), 0) FROM orders WHERE created_at >= $1 AND created_at < $2 AND status != 'отменён'",
-            start_date, end_date
-        )
-        avg_check = total_revenue // total_orders if total_orders else 0
+    try:
+        async with db_pool.acquire() as conn:
+            total_orders = await conn.fetchval(
+                "SELECT COUNT(*) FROM orders WHERE created_at >= $1 AND created_at < $2",
+                start_date, end_date
+            )
+            total_revenue = await conn.fetchval(
+                "SELECT COALESCE(SUM(total), 0) FROM orders WHERE created_at >= $1 AND created_at < $2 AND status != 'отменён'",
+                start_date, end_date
+            )
+            avg_check = total_revenue // total_orders if total_orders else 0
 
-        # Топ товаров
-        top_products = await conn.fetch(
-            """
-            SELECT p.name, SUM(oi.quantity) AS qty, SUM(oi.quantity * p.price) AS revenue
-            FROM orders o
-            CROSS JOIN LATERAL jsonb_each_text(o.items) AS oi(product_id, quantity)
-            JOIN products p ON p.id = oi.product_id::int
-            WHERE o.created_at >= $1 AND o.created_at < $2 AND o.status != 'отменён'
-            GROUP BY p.id, p.name
-            ORDER BY revenue DESC
-            LIMIT 5
-            """,
-            start_date, end_date
+        text = (
+            f"📈 *Отчёт за {period_name}*\n\n"
+            f"📅 Период: {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}\n\n"
+            f"📦 Всего заказов: *{total_orders}*\n"
+            f"💰 Выручка: *{total_revenue}* руб.\n"
+            f"🧾 Средний чек: *{avg_check}* руб."
         )
-        # Но у нас нет поля items, мы не храним состав заказа в JSON. Нужно будет переделать структуру, но для простоты топ товаров можно сделать через отдельную таблицу order_items. Мы можем пропустить топ товаров или сделать упрощённо через общую выручку.
-        # Поскольку у нас нет детализации заказов, мы не можем собрать топ товаров.
-        # Вместо этого покажем общее количество заказов и выручку.
-    # Формируем текст отчёта
-    text = (
-        f"📈 *Отчёт за {period_name}*\n\n"
-        f"📅 Период: {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}\n\n"
-        f"📦 Всего заказов: *{total_orders}*\n"
-        f"💰 Выручка: *{total_revenue}* руб.\n"
-        f"🧾 Средний чек: *{avg_check}* руб.\n"
-        f"\n(Детализация по товарам в разработке)"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
-    ])
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
+        ])
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Ошибка генерации отчёта: {e}", exc_info=True)
+        await callback.message.edit_text("⚠️ Ошибка при формировании отчёта. Попробуйте позже.")
     await callback.answer()
 
 @dp.callback_query(F.data == "report_today")
 async def report_today(callback: CallbackQuery):
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow = today + timedelta(days=1)
-    await generate_report(callback, today, tomorrow, "сегодня")
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        await generate_report(callback, today, tomorrow, "сегодня")
+    except Exception as e:
+        logger.error(f"Ошибка в report_today: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "report_yesterday")
 async def report_yesterday(callback: CallbackQuery):
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today - timedelta(days=1)
-    await generate_report(callback, yesterday_start, today, "вчера")
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today - timedelta(days=1)
+        await generate_report(callback, yesterday_start, today, "вчера")
+    except Exception as e:
+        logger.error(f"Ошибка в report_yesterday: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "report_week")
 async def report_week(callback: CallbackQuery):
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    week_ago = today - timedelta(days=7)
-    await generate_report(callback, week_ago, today, "последние 7 дней")
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        week_ago = today - timedelta(days=7)
+        await generate_report(callback, week_ago, today, "последние 7 дней")
+    except Exception as e:
+        logger.error(f"Ошибка в report_week: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "report_month")
 async def report_month(callback: CallbackQuery):
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    month_ago = today - timedelta(days=30)
-    await generate_report(callback, month_ago, today, "последние 30 дней")
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        month_ago = today - timedelta(days=30)
+        await generate_report(callback, month_ago, today, "последние 30 дней")
+    except Exception as e:
+        logger.error(f"Ошибка в report_month: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "report_custom")
 async def report_custom_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📅 Введите дату начала (в формате ДД.ММ.ГГГГ), например 01.01.2025:")
-    await state.set_state(ReportForm.waiting_for_custom_start)
-    await callback.answer()
+    try:
+        await callback.message.edit_text("📅 Введите дату начала (в формате ДД.ММ.ГГГГ), например 01.01.2025:")
+        await state.set_state(ReportForm.waiting_for_custom_start)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка в report_custom_start: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.message(ReportForm.waiting_for_custom_start)
 async def report_custom_get_start(message: Message, state: FSMContext):
@@ -807,14 +808,12 @@ async def report_custom_get_start(message: Message, state: FSMContext):
 async def report_custom_get_end(message: Message, state: FSMContext):
     try:
         end_date = datetime.strptime(message.text.strip(), "%d.%m.%Y")
-        # Корректируем: добавляем один день, чтобы включить весь день
         end_date = end_date.replace(hour=23, minute=59, second=59)
         data = await state.get_data()
         start_date = data["start_date"]
         if start_date > end_date:
             await message.answer("❌ Дата начала не может быть позже даты окончания.")
             return
-        # Имитируем callback для отчёта
         # Создаём фиктивный callback-объект
         class DummyCallback:
             def __init__(self, msg, user_id):
@@ -828,43 +827,45 @@ async def report_custom_get_end(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Неверный формат. Введите дату в формате ДД.ММ.ГГГГ.")
 
-# ---- Топ товаров (упрощённо, через общую статистику) ----
-# Так как у нас нет детализации, пропустим пока топ товаров, либо сделаем заглушку.
-# Можно добавить позже, когда будем хранить состав заказа.
-
 @dp.callback_query(F.data == "report_top")
 async def report_top(callback: CallbackQuery):
-    # Заглушка
-    text = "🏆 *Топ товаров*\n\nФункция в разработке. Для её работы нужно хранить состав заказа в отдельной таблице."
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
-    ])
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
-    await callback.answer()
-
-# ---- Новые пользователи ----
-@dp.callback_query(F.data == "report_users")
-async def report_users(callback: CallbackQuery):
-    async with db_pool.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        new_today = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", today)
-        week_ago = today - timedelta(days=7)
-        new_week = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", week_ago)
-        month_ago = today - timedelta(days=30)
-        new_month = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", month_ago)
     text = (
-        f"👥 *Новые пользователи*\n\n"
-        f"• Всего: *{total_users}*\n"
-        f"• За сегодня: *{new_today}*\n"
-        f"• За неделю: *{new_week}*\n"
-        f"• За месяц: *{new_month}*"
+        "🏆 *Топ товаров*\n\n"
+        "Функция в разработке. Для её работы нужно хранить состав заказа в отдельной таблице.\n"
+        "Скоро добавим!"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
     ])
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
     await callback.answer()
+
+@dp.callback_query(F.data == "report_users")
+async def report_users(callback: CallbackQuery):
+    try:
+        async with db_pool.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            new_today = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", today)
+            week_ago = today - timedelta(days=7)
+            new_week = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", week_ago)
+            month_ago = today - timedelta(days=30)
+            new_month = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", month_ago)
+        text = (
+            f"👥 *Новые пользователи*\n\n"
+            f"• Всего: *{total_users}*\n"
+            f"• За сегодня: *{new_today}*\n"
+            f"• За неделю: *{new_week}*\n"
+            f"• За месяц: *{new_month}*"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
+        ])
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка в report_users: {e}", exc_info=True)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 # ---------- Рассылка ----------
 @dp.callback_query(F.data == "admin_broadcast")
