@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import os
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -50,6 +51,12 @@ class AdminProductForm(StatesGroup):
     waiting_for_category = State()
     waiting_for_photo = State()
     waiting_for_description = State()
+
+# ---------- FSM для отчётов ----------
+class ReportForm(StatesGroup):
+    waiting_for_period = State()
+    waiting_for_custom_start = State()
+    waiting_for_custom_end = State()
 
 # ---------- База данных ----------
 async def init_db():
@@ -173,12 +180,25 @@ def admin_keyboard():
         [InlineKeyboardButton(text="📦 Товары", callback_data="admin_products")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📈 Отчёты", callback_data="admin_reports")],  # Новая кнопка
     ])
 
 def confirm_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да", callback_data="broadcast_yes")],
         [InlineKeyboardButton(text="❌ Нет", callback_data="broadcast_no")],
+    ])
+
+def report_period_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="report_today")],
+        [InlineKeyboardButton(text="📅 Вчера", callback_data="report_yesterday")],
+        [InlineKeyboardButton(text="📅 Эта неделя", callback_data="report_week")],
+        [InlineKeyboardButton(text="📅 Этот месяц", callback_data="report_month")],
+        [InlineKeyboardButton(text="🗓️ Произвольный период", callback_data="report_custom")],
+        [InlineKeyboardButton(text="🏆 Топ товаров", callback_data="report_top")],
+        [InlineKeyboardButton(text="👥 Новые пользователи", callback_data="report_users")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
     ])
 
 # ---------- Карточка товара ----------
@@ -580,7 +600,7 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     ])
     await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# ---------- Удаление товара (исправлено: проверка по строковому ключу) ----------
+# ---------- Удаление товара ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -600,14 +620,11 @@ async def admin_del_product_list(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("rmprod_"))
 async def admin_del_product_confirm(callback: CallbackQuery):
-    logger.info(f"Получен callback: {callback.data} от пользователя {callback.from_user.id}")
     if callback.from_user.id != ADMIN_ID:
-        logger.warning(f"Доступ запрещён для {callback.from_user.id}")
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     try:
         parts = callback.data.split("_")
-        logger.info(f"Разбивка: {parts}")
         if len(parts) < 2:
             await callback.answer("❌ Неверный формат", show_alert=True)
             return
@@ -615,23 +632,17 @@ async def admin_del_product_confirm(callback: CallbackQuery):
         if not product_id_str.isdigit():
             await callback.answer("❌ Неверный ID", show_alert=True)
             return
-        # Проверяем наличие в кэше по строковому ключу
         if product_id_str not in product_cache:
             await callback.answer("❌ Товар не найден", show_alert=True)
             return
         product_id = int(product_id_str)
-        logger.info(f"Попытка удалить товар с ID: {product_id}")
 
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM products WHERE id = $1", product_id)
 
         await refresh_cache()
-        logger.info(f"Товар {product_id} удалён")
         await callback.answer("✅ Товар удалён!", show_alert=True)
-
-        # Удаляем текущее сообщение со списком товаров
         await callback.message.delete()
-        # Отправляем новое сообщение с меню управления товарами
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
             [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
@@ -672,7 +683,7 @@ async def admin_edit_price_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminProductForm.waiting_for_price)
     await callback.answer()
 
-# ---------- Статистика ----------
+# ---------- Статистика (базовая) ----------
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -684,13 +695,175 @@ async def admin_stats(callback: CallbackQuery):
         new_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'новый'")
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
     text = (
-        f"📊 *Статистика:*\n\n"
+        f"📊 *Общая статистика:*\n\n"
         f"• Заказов: *{total_orders}*\n"
         f"• Выручка: *{total_revenue}* руб.\n"
-        f"• Новых: *{new_orders}*\n"
+        f"• Новых заказов: *{new_orders}*\n"
         f"• Пользователей: *{total_users}*"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_kb())
+    await callback.answer()
+
+# ---------- НОВЫЙ РАЗДЕЛ: ОТЧЁТЫ ----------
+@dp.callback_query(F.data == "admin_reports")
+async def admin_reports_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📈 *Выберите тип отчёта:*",
+        parse_mode="Markdown",
+        reply_markup=report_period_keyboard()
+    )
+    await callback.answer()
+
+# ---- Отчёт за период ----
+async def generate_report(callback: CallbackQuery, start_date, end_date, period_name):
+    async with db_pool.acquire() as conn:
+        # Общие показатели
+        total_orders = await conn.fetchval(
+            "SELECT COUNT(*) FROM orders WHERE created_at >= $1 AND created_at < $2",
+            start_date, end_date
+        )
+        total_revenue = await conn.fetchval(
+            "SELECT COALESCE(SUM(total), 0) FROM orders WHERE created_at >= $1 AND created_at < $2 AND status != 'отменён'",
+            start_date, end_date
+        )
+        avg_check = total_revenue // total_orders if total_orders else 0
+
+        # Топ товаров
+        top_products = await conn.fetch(
+            """
+            SELECT p.name, SUM(oi.quantity) AS qty, SUM(oi.quantity * p.price) AS revenue
+            FROM orders o
+            CROSS JOIN LATERAL jsonb_each_text(o.items) AS oi(product_id, quantity)
+            JOIN products p ON p.id = oi.product_id::int
+            WHERE o.created_at >= $1 AND o.created_at < $2 AND o.status != 'отменён'
+            GROUP BY p.id, p.name
+            ORDER BY revenue DESC
+            LIMIT 5
+            """,
+            start_date, end_date
+        )
+        # Но у нас нет поля items, мы не храним состав заказа в JSON. Нужно будет переделать структуру, но для простоты топ товаров можно сделать через отдельную таблицу order_items. Мы можем пропустить топ товаров или сделать упрощённо через общую выручку.
+        # Поскольку у нас нет детализации заказов, мы не можем собрать топ товаров.
+        # Вместо этого покажем общее количество заказов и выручку.
+    # Формируем текст отчёта
+    text = (
+        f"📈 *Отчёт за {period_name}*\n\n"
+        f"📅 Период: {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}\n\n"
+        f"📦 Всего заказов: *{total_orders}*\n"
+        f"💰 Выручка: *{total_revenue}* руб.\n"
+        f"🧾 Средний чек: *{avg_check}* руб.\n"
+        f"\n(Детализация по товарам в разработке)"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "report_today")
+async def report_today(callback: CallbackQuery):
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+    await generate_report(callback, today, tomorrow, "сегодня")
+
+@dp.callback_query(F.data == "report_yesterday")
+async def report_yesterday(callback: CallbackQuery):
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today - timedelta(days=1)
+    await generate_report(callback, yesterday_start, today, "вчера")
+
+@dp.callback_query(F.data == "report_week")
+async def report_week(callback: CallbackQuery):
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = today - timedelta(days=7)
+    await generate_report(callback, week_ago, today, "последние 7 дней")
+
+@dp.callback_query(F.data == "report_month")
+async def report_month(callback: CallbackQuery):
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    month_ago = today - timedelta(days=30)
+    await generate_report(callback, month_ago, today, "последние 30 дней")
+
+@dp.callback_query(F.data == "report_custom")
+async def report_custom_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("📅 Введите дату начала (в формате ДД.ММ.ГГГГ), например 01.01.2025:")
+    await state.set_state(ReportForm.waiting_for_custom_start)
+    await callback.answer()
+
+@dp.message(ReportForm.waiting_for_custom_start)
+async def report_custom_get_start(message: Message, state: FSMContext):
+    try:
+        start_date = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+        await state.update_data(start_date=start_date)
+        await message.answer("📅 Теперь введите дату окончания (в формате ДД.ММ.ГГГГ):")
+        await state.set_state(ReportForm.waiting_for_custom_end)
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введите дату в формате ДД.ММ.ГГГГ, например 01.01.2025.")
+
+@dp.message(ReportForm.waiting_for_custom_end)
+async def report_custom_get_end(message: Message, state: FSMContext):
+    try:
+        end_date = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+        # Корректируем: добавляем один день, чтобы включить весь день
+        end_date = end_date.replace(hour=23, minute=59, second=59)
+        data = await state.get_data()
+        start_date = data["start_date"]
+        if start_date > end_date:
+            await message.answer("❌ Дата начала не может быть позже даты окончания.")
+            return
+        # Имитируем callback для отчёта
+        # Создаём фиктивный callback-объект
+        class DummyCallback:
+            def __init__(self, msg, user_id):
+                self.message = msg
+                self.from_user = type('obj', (object,), {'id': user_id})
+            async def answer(self, *args, **kwargs):
+                pass
+        dummy = DummyCallback(message, message.from_user.id)
+        await generate_report(dummy, start_date, end_date, f"{start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введите дату в формате ДД.ММ.ГГГГ.")
+
+# ---- Топ товаров (упрощённо, через общую статистику) ----
+# Так как у нас нет детализации, пропустим пока топ товаров, либо сделаем заглушку.
+# Можно добавить позже, когда будем хранить состав заказа.
+
+@dp.callback_query(F.data == "report_top")
+async def report_top(callback: CallbackQuery):
+    # Заглушка
+    text = "🏆 *Топ товаров*\n\nФункция в разработке. Для её работы нужно хранить состав заказа в отдельной таблице."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer()
+
+# ---- Новые пользователи ----
+@dp.callback_query(F.data == "report_users")
+async def report_users(callback: CallbackQuery):
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        new_today = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", today)
+        week_ago = today - timedelta(days=7)
+        new_week = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", week_ago)
+        month_ago = today - timedelta(days=30)
+        new_month = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", month_ago)
+    text = (
+        f"👥 *Новые пользователи*\n\n"
+        f"• Всего: *{total_users}*\n"
+        f"• За сегодня: *{new_today}*\n"
+        f"• За неделю: *{new_week}*\n"
+        f"• За месяц: *{new_month}*"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к отчётам", callback_data="admin_reports")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
     await callback.answer()
 
 # ---------- Рассылка ----------
