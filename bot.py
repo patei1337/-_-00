@@ -50,7 +50,7 @@ class AdminProductForm(StatesGroup):
     waiting_for_price = State()
     waiting_for_category = State()
     waiting_for_photo = State()
-    waiting_for_description = State()  # добавлено
+    waiting_for_description = State()
 
 # ---------- База данных ----------
 async def init_db():
@@ -58,7 +58,7 @@ async def init_db():
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with db_pool.acquire() as conn:
-        # Таблица товаров (без description)
+        # Таблица товаров
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id SERIAL PRIMARY KEY,
@@ -239,15 +239,10 @@ async def send_product_card(chat_id, product, edit=False, message_id=None):
 @dp.message(Command("start"))
 async def start_handler(message: Message):
     await save_user(message.from_user.id)
-    photo_url = "https://example.com/welcome_bouquet.jpg"  # замените на своё фото
-    await bot.send_photo(
-        chat_id=message.chat.id,
-        photo=photo_url,
-        caption=(
-            "🌹 *Добро пожаловать в «Цветочный рай»!* 🌹\n\n"
-            "Мы дарим радость с 2010 года.\n"
-            "Выберите категорию ниже, чтобы начать:"
-        ),
+    await message.answer(
+        "🌹 *Добро пожаловать в «Цветочный рай»!* 🌹\n\n"
+        "Мы дарим радость с 2010 года.\n"
+        "Выберите категорию ниже, чтобы начать:",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -531,7 +526,6 @@ async def admin_add_product_price(message: Message, state: FSMContext):
         await refresh_cache()
         await message.answer("✅ Цена обновлена!")
         await state.clear()
-        # Отправляем меню товаров (через callback не получится, поэтому просто новое сообщение)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
             [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
