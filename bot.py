@@ -350,9 +350,11 @@ async def decrease_cart(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("del_"))
 async def remove_item(callback: CallbackQuery):
     try:
+        # Удаление из корзины только если формат del_число
         parts = callback.data.split("_")
         if len(parts) != 2 or not parts[1].isdigit():
-            return  # игнорируем другие callback'и
+            # игнорируем другие callback'и (например, rmprod_...)
+            return
         product_id = parts[1]
         user_id = callback.from_user.id
         await update_cart(user_id, int(product_id), None)
@@ -580,7 +582,7 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     ])
     await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# ---------- Удаление товара (исправленное с логами) ----------
+# ---------- Удаление товара (исправлено: префикс rmprod_) ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -593,12 +595,12 @@ async def admin_del_product_list(callback: CallbackQuery):
     text = "Выберите товар для удаления:\n"
     buttons = []
     for pid, p in product_cache.items():
-        buttons.append([InlineKeyboardButton(text=f"🗑️ {p['name']}", callback_data=f"del_prod_{pid}")])
+        buttons.append([InlineKeyboardButton(text=f"🗑️ {p['name']}", callback_data=f"rmprod_{pid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_products")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("del_prod_"))
+@dp.callback_query(F.data.startswith("rmprod_"))
 async def admin_del_product_confirm(callback: CallbackQuery):
     logger.info(f"Получен callback: {callback.data} от пользователя {callback.from_user.id}")
     if callback.from_user.id != ADMIN_ID:
@@ -608,10 +610,10 @@ async def admin_del_product_confirm(callback: CallbackQuery):
     try:
         parts = callback.data.split("_")
         logger.info(f"Разбивка: {parts}")
-        if len(parts) < 3:
+        if len(parts) < 2:
             await callback.answer("❌ Неверный формат", show_alert=True)
             return
-        product_id_str = parts[2]
+        product_id_str = parts[1]
         if not product_id_str.isdigit():
             await callback.answer("❌ Неверный ID", show_alert=True)
             return
