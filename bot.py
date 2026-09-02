@@ -350,14 +350,19 @@ async def decrease_cart(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("del_"))
 async def remove_item(callback: CallbackQuery):
     try:
-        product_id = callback.data.split("_")[1]
+        # Проверяем, что это именно формат del_число (корзина)
+        parts = callback.data.split("_")
+        if len(parts) != 2 or not parts[1].isdigit():
+            # Если это не del_число, игнорируем (это может быть del_prod_..., который обработает другой хендлер)
+            return
+        product_id = parts[1]
         user_id = callback.from_user.id
         await update_cart(user_id, int(product_id), None)
         await show_cart_handler(callback)
         await callback.answer("🗑️ Удалено")
     except Exception as e:
-        logger.error("Ошибка удаления: %s", e)
-        await callback.answer("⚠️ Ошибка")
+        logger.error("Ошибка удаления из корзины: %s", e)
+        await callback.answer("⚠️ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data == "checkout")
 async def start_order(callback: CallbackQuery, state: FSMContext):
@@ -577,7 +582,7 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     ])
     await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# ---------- Удаление товара (исправленное) ----------
+# ---------- Удаление товара (исправленное, теперь используем del_prod_) ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -590,12 +595,12 @@ async def admin_del_product_list(callback: CallbackQuery):
     text = "Выберите товар для удаления:\n"
     buttons = []
     for pid, p in product_cache.items():
-        buttons.append([InlineKeyboardButton(text=f"🗑️ {p['name']}", callback_data=f"del_product_{pid}")])
+        buttons.append([InlineKeyboardButton(text=f"🗑️ {p['name']}", callback_data=f"del_prod_{pid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_products")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("del_product_"))
+@dp.callback_query(F.data.startswith("del_prod_"))
 async def admin_del_product_confirm(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
