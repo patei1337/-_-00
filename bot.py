@@ -37,23 +37,42 @@ dp = Dispatcher(storage=storage)
 db_pool = None
 product_cache = {}
 
+# ---------- FSM ----------
+class OrderForm(StatesGroup):
+    address = State()
+    phone = State()
+
+class BroadcastForm(StatesGroup):
+    waiting_for_confirm = State()
+
+class AdminProductForm(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_price = State()
+    waiting_for_category = State()
+    waiting_for_photo = State()
+    waiting_for_description = State()  # добавлено
+
 # ---------- База данных ----------
 async def init_db():
     global db_pool, product_cache
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with db_pool.acquire() as conn:
-        # Таблица товаров (добавляем описание)
+        # Таблица товаров (без description)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 price INTEGER NOT NULL,
                 photo TEXT,
-                category TEXT NOT NULL,
-                description TEXT DEFAULT 'Отличный выбор!'
+                category TEXT NOT NULL
             )
         ''')
+        # Добавляем столбец description, если его нет
+        await conn.execute('''
+            ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT DEFAULT 'Отличный выбор!'
+        ''')
+
         # Таблица корзин
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS carts (
@@ -91,7 +110,7 @@ async def init_db():
         if count == 0:
             await conn.execute("INSERT INTO users (user_id) SELECT DISTINCT user_id FROM orders ON CONFLICT (user_id) DO NOTHING")
 
-        # Заполняем тестовыми товарами с описанием
+        # Заполняем тестовыми товарами
         count = await conn.fetchval("SELECT COUNT(*) FROM products")
         if count == 0:
             await conn.executemany(
@@ -119,7 +138,7 @@ async def refresh_cache():
         }
     logger.info("Кэш товаров обновлён, %d записей", len(product_cache))
 
-# ---------- Работа с корзиной ----------
+# ---------- Работа с корзиной и пользователями ----------
 async def get_cart(user_id: int):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -146,27 +165,12 @@ async def clear_cart(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM carts WHERE user_id = $1", user_id)
 
-# ---------- Сохранение пользователя ----------
 async def save_user(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             user_id
         )
-
-# ---------- FSM ----------
-class OrderForm(StatesGroup):
-    address = State()
-    phone = State()
-
-class BroadcastForm(StatesGroup):
-    waiting_for_confirm = State()
-
-class AdminProductForm(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_price = State()
-    waiting_for_category = State()
-    waiting_for_photo = State()
 
 # ---------- Валидаторы ----------
 def validate_address(address: str) -> bool:
@@ -203,7 +207,7 @@ def confirm_keyboard():
         [InlineKeyboardButton(text="❌ Нет, отменить", callback_data="broadcast_no")],
     ])
 
-# ---------- Вспомогательная функция для карточки товара ----------
+# ---------- Карточка товара ----------
 async def send_product_card(chat_id, product, edit=False, message_id=None):
     text = (
         f"🌸 *{product['name']}*\n"
@@ -215,7 +219,7 @@ async def send_product_card(chat_id, product, edit=False, message_id=None):
         [InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_{product['id']}")],
         [InlineKeyboardButton(text="🔙 Назад к категориям", callback_data="back_to_menu")],
     ])
-    if product.get('photo'):
+    if product.get('photo') and product['photo'] not in (None, 'нет'):
         if edit and message_id:
             await bot.edit_message_media(
                 chat_id=chat_id,
@@ -235,7 +239,7 @@ async def send_product_card(chat_id, product, edit=False, message_id=None):
 @dp.message(Command("start"))
 async def start_handler(message: Message):
     await save_user(message.from_user.id)
-    photo_url = "https://example.com/welcome_bouquet.jpg"  # замените на реальную ссылку
+    photo_url = "https://example.com/welcome_bouquet.jpg"  # замените на своё фото
     await bot.send_photo(
         chat_id=message.chat.id,
         photo=photo_url,
@@ -252,18 +256,18 @@ async def start_handler(message: Message):
 async def show_products(callback: CallbackQuery):
     try:
         category = callback.data.split("_")[1]
-        # Ищем товары категории
         products = [p for p in product_cache.values() if p["category"] == category]
         if not products:
             await callback.message.edit_text("В этой категории пока нет товаров.", reply_markup=back_kb())
             await callback.answer()
             return
-        # Отправляем первый товар (для простоты пока один)
-        # Сохраним список всех товаров категории в кэше для навигации, но пока просто покажем первый
+        # Берём первый товар категории (можно доработать пагинацию)
         product = products[0]
-        product['id'] = [k for k, v in product_cache.items() if v['name'] == product['name'] and v['category'] == product['category']][0]
-        await send_product_card(callback.message.chat.id, product, edit=False)
-        await callback.message.delete()  # удаляем старое сообщение с кнопками
+        # Находим его ID
+        pid = [k for k, v in product_cache.items() if v['name'] == product['name'] and v['category'] == product['category']][0]
+        product['id'] = pid
+        await send_product_card(callback.message.chat.id, product)
+        await callback.message.delete()
         await callback.answer()
     except Exception as e:
         logger.error("Ошибка в show_products: %s", e, exc_info=True)
@@ -302,8 +306,8 @@ async def show_cart_handler(callback: CallbackQuery):
             total += price
             text += f"🌸 {p['name']} × {qty} = *{price} руб.*\n"
             buttons.append([
-                InlineKeyboardButton(text=f"➖", callback_data=f"dec_{pid}"),
-                InlineKeyboardButton(text=f"➕", callback_data=f"add_{pid}"),
+                InlineKeyboardButton(text="➖", callback_data=f"dec_{pid}"),
+                InlineKeyboardButton(text="➕", callback_data=f"add_{pid}"),
                 InlineKeyboardButton(text="🗑️", callback_data=f"del_{pid}"),
             ])
         text += f"\n━━━━━━━━━━━━━━━━━\n*Итого: {total} руб.*"
@@ -393,22 +397,18 @@ async def get_phone(message: Message, state: FSMContext):
             order_lines.append(line)
             total += p['price'] * qty
 
-    # Сохраняем заказ в БД
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # Вставляем заказ и получаем id
             row = await conn.fetchrow(
                 "INSERT INTO orders (user_id, address, phone, total, status) VALUES ($1, $2, $3, $4, $5) RETURNING id",
                 user_id, address, phone, total, 'новый'
             )
             order_id = row['id']
-            # Сохраняем пользователя
             await conn.execute(
                 "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
                 user_id
             )
 
-    # Отправляем красивое подтверждение
     order_text = (
         f"✅ *Заказ №{order_id} оформлен!*\n\n"
         f"📦 *Состав:*\n{chr(10).join(order_lines)}\n"
@@ -420,7 +420,6 @@ async def get_phone(message: Message, state: FSMContext):
     )
     await bot.send_message(message.chat.id, order_text, parse_mode="Markdown")
 
-    # Уведомление админу
     admin_notify = f"🆕 Новый заказ #{order_id}\nАдрес: {address}\nТелефон: {phone}\nСумма: {total} руб."
     await bot.send_message(ADMIN_ID, admin_notify)
 
@@ -532,7 +531,14 @@ async def admin_add_product_price(message: Message, state: FSMContext):
         await refresh_cache()
         await message.answer("✅ Цена обновлена!")
         await state.clear()
-        await admin_products_menu(message)  # переиспользуем
+        # Отправляем меню товаров (через callback не получится, поэтому просто новое сообщение)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+            [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+        ])
+        await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
     else:
         await state.update_data(price=price)
         await message.answer("Введите категорию (розы, тюльпаны, сборные):")
@@ -546,15 +552,10 @@ async def admin_add_product_category(message: Message, state: FSMContext):
 
 @dp.message(AdminProductForm.waiting_for_photo)
 async def admin_add_product_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
     photo = message.text.strip() if message.text.strip().lower() != "нет" else None
-    # запросим описание
     await state.update_data(photo=photo)
     await message.answer("Введите краткое описание товара (можно пропустить, введите 'нет'):")
-    await state.set_state(AdminProductForm.waiting_for_description)  # добавим новое состояние
-
-# Добавим новое состояние в класс AdminProductForm
-AdminProductForm.waiting_for_description = State()
+    await state.set_state(AdminProductForm.waiting_for_description)
 
 @dp.message(AdminProductForm.waiting_for_description)
 async def admin_add_product_description(message: Message, state: FSMContext):
@@ -568,10 +569,15 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     await refresh_cache()
     await message.answer(f"✅ Товар «{data['name']}» добавлен!")
     await state.clear()
-    await admin_products_menu(message)  # возврат в меню товаров
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+    ])
+    await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# Остальные обработчики для товаров (удаление, изменение цены) остаются без изменений, но их нужно добавить, чтобы код был полным.
-# Они уже были в предыдущей версии. Я включу их для полноты.
+# Удаление товара
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -601,6 +607,7 @@ async def admin_del_product_confirm(callback: CallbackQuery):
     await callback.answer("✅ Товар удалён", show_alert=True)
     await admin_products_menu(callback)
 
+# Изменение цены
 @dp.callback_query(F.data == "admin_edit_price")
 async def admin_edit_price_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
