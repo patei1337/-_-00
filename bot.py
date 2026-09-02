@@ -1,19 +1,26 @@
 import asyncio
 import logging
 import re
-import sqlite3
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import aiosqlite
+import asyncpg
 
 # ---------- Конфиг ----------
-BOT_TOKEN = "8721155454:AAGZYGedIHyVkzFogM__jSqpItff8oEOaaM"
-ADMIN_CHAT_ID = 8791190493
-DB_PATH = "shop.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не задан в переменных окружения")
+if not ADMIN_ID:
+    raise ValueError("ADMIN_ID не задан в переменных окружения")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,96 +34,109 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ---------- Инициализация БД и кэша ----------
-product_cache = {}  # {product_id: {name, price, photo, category}}
+db_pool = None
+product_cache = {}
 
+# ---------- База данных ----------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
+    global db_pool, product_cache
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with db_pool.acquire() as conn:
+        # Таблица товаров
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 price INTEGER NOT NULL,
                 photo TEXT,
                 category TEXT NOT NULL
             )
         ''')
-        await db.execute('''
+        # Таблица корзин
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS carts (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 product_id INTEGER NOT NULL,
                 quantity INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (user_id, product_id)
             )
         ''')
-        await db.execute('''
+        # Таблица заказов с полем status
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 address TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 total INTEGER NOT NULL,
+                status TEXT DEFAULT 'новый',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Заполним тестовыми товарами, если пусто
-        cursor = await db.execute("SELECT COUNT(*) FROM products")
-        count = (await cursor.fetchone())[0]
+        # Если таблица уже существовала без status — добавляем
+        await conn.execute('''
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'новый'
+        ''')
+
+        # Заполняем тестовыми товарами, если пусто
+        count = await conn.fetchval("SELECT COUNT(*) FROM products")
         if count == 0:
-            sample = [
-                ("Розы 101", 1500, "https://example.com/rose.jpg", "розы"),
-                ("Тюльпаны 20", 1200, "https://example.com/tulip.jpg", "тюльпаны"),
-                ("Сборный букет", 2000, "https://example.com/mix.jpg", "сборные"),
-            ]
-            await db.executemany(
-                "INSERT INTO products (name, price, photo, category) VALUES (?, ?, ?, ?)",
-                sample
+            await conn.executemany(
+                "INSERT INTO products (name, price, photo, category) VALUES ($1, $2, $3, $4)",
+                [
+                    ("Розы 101", 1500, "https://example.com/rose.jpg", "розы"),
+                    ("Тюльпаны 20", 1200, "https://example.com/tulip.jpg", "тюльпаны"),
+                    ("Сборный букет", 2000, "https://example.com/mix.jpg", "сборные"),
+                ]
             )
-        await db.commit()
     await refresh_cache()
 
 async def refresh_cache():
     global product_cache
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, name, price, photo, category FROM products")
-        rows = await cursor.fetchall()
-        product_cache = {str(row[0]): {"name": row[1], "price": row[2], "photo": row[3], "category": row[4]} for row in rows}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name, price, photo, category FROM products")
+        product_cache = {str(row["id"]): {"name": row["name"], "price": row["price"], "photo": row["photo"], "category": row["category"]} for row in rows}
     logger.info("Кэш товаров обновлён, %d записей", len(product_cache))
 
-# ---------- Работа с корзиной (БД) ----------
+# ---------- Работа с корзиной ----------
 async def get_cart(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT product_id, quantity FROM carts WHERE user_id = ?",
-            (user_id,)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT product_id, quantity FROM carts WHERE user_id = $1",
+            user_id
         )
-        rows = await cursor.fetchall()
-        return {str(pid): qty for pid, qty in rows}
+        return {str(row["product_id"]): row["quantity"] for row in rows}
 
 async def update_cart(user_id: int, product_id: int, quantity: int = None):
-    """quantity = None означает удалить"""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as conn:
         if quantity is None or quantity == 0:
-            await db.execute(
-                "DELETE FROM carts WHERE user_id = ? AND product_id = ?",
-                (user_id, product_id)
+            await conn.execute(
+                "DELETE FROM carts WHERE user_id = $1 AND product_id = $2",
+                user_id, product_id
             )
         else:
-            await db.execute(
-                "INSERT OR REPLACE INTO carts (user_id, product_id, quantity) VALUES (?, ?, ?)",
-                (user_id, product_id, quantity)
+            await conn.execute(
+                "INSERT INTO carts (user_id, product_id, quantity) VALUES ($1, $2, $3) "
+                "ON CONFLICT (user_id, product_id) DO UPDATE SET quantity = $3",
+                user_id, product_id, quantity
             )
-        await db.commit()
 
 async def clear_cart(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM carts WHERE user_id = $1", user_id)
 
 # ---------- FSM для заказа ----------
 class OrderForm(StatesGroup):
     address = State()
     phone = State()
+
+# ---------- FSM для управления товарами ----------
+class AdminProductForm(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_price = State()
+    waiting_for_category = State()
+    waiting_for_photo = State()
 
 # ---------- Валидаторы ----------
 def validate_address(address: str) -> bool:
@@ -139,7 +159,14 @@ def back_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
     ])
 
-# ---------- Обработчики ----------
+def admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Заказы", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="📦 Товары", callback_data="admin_products")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+    ])
+
+# ---------- Обработчики пользователей ----------
 @dp.message(Command("start"))
 async def start_handler(message: Message):
     await message.answer("🌹 Добро пожаловать в цветочный магазин!", reply_markup=main_menu_kb())
@@ -218,7 +245,7 @@ async def decrease_cart(callback: CallbackQuery):
                 await update_cart(user_id, int(product_id), new_qty)
             else:
                 await update_cart(user_id, int(product_id), None)
-            await show_cart_handler(callback)  # обновить
+            await show_cart_handler(callback)
         else:
             await callback.answer("Товара нет в корзине")
     except Exception as e:
@@ -284,15 +311,14 @@ async def get_phone(message: Message, state: FSMContext):
             order_lines.append(line)
             total += p['price'] * qty
     order_text = f"🆕 Новый заказ!\nАдрес: {address}\nТелефон: {phone}\n\n" + "\n".join(order_lines) + f"\nИтого: {total} руб."
-    # Сохраняем заказ в БД (опционально)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO orders (user_id, address, phone, total) VALUES (?, ?, ?, ?)",
-            (user_id, address, phone, total)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO orders (user_id, address, phone, total, status) VALUES ($1, $2, $3, $4, $5)",
+            user_id, address, phone, total, 'новый'
         )
-        await db.commit()
-    # Отправляем админу
-    await bot.send_message(ADMIN_CHAT_ID, order_text)
+
+    await bot.send_message(ADMIN_ID, order_text)
     await clear_cart(user_id)
     await message.answer("✅ Заказ оформлен! Спасибо, мы свяжемся с вами.")
     await state.clear()
@@ -302,10 +328,227 @@ async def back_to_menu(callback: CallbackQuery):
     await callback.message.edit_text("🌹 Главное меню:", reply_markup=main_menu_kb())
     await callback.answer()
 
+# ---------- Админ-панель ----------
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+    await message.answer("👋 Добро пожаловать в админ-панель!", reply_markup=admin_keyboard())
+
+@dp.callback_query(F.data == "admin_orders")
+async def admin_show_orders(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, user_id, address, phone, total, status, created_at FROM orders ORDER BY created_at DESC LIMIT 10"
+        )
+    if not rows:
+        await callback.message.edit_text("📭 Заказов пока нет.", reply_markup=back_kb())
+        await callback.answer()
+        return
+    text = "📋 Последние заказы:\n\n"
+    buttons = []
+    for row in rows:
+        text += f"#{row['id']} | {row['created_at'].strftime('%d.%m %H:%M')} | {row['status']} | {row['total']} руб.\n"
+        status_buttons = [
+            InlineKeyboardButton(text="✅ В работу", callback_data=f"set_status_{row['id']}_в работе"),
+            InlineKeyboardButton(text="🚚 Доставлен", callback_data=f"set_status_{row['id']}_доставлен"),
+            InlineKeyboardButton(text="❌ Отменён", callback_data=f"set_status_{row['id']}_отменён"),
+        ]
+        buttons.append(status_buttons)
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_status_"))
+async def admin_set_status(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    order_id = int(parts[2])
+    new_status = "_".join(parts[3:])
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE orders SET status = $1 WHERE id = $2",
+            new_status, order_id
+        )
+    await callback.answer(f"✅ Статус заказа #{order_id} изменён на «{new_status}»", show_alert=True)
+    await admin_show_orders(callback)
+
+@dp.callback_query(F.data == "admin_products")
+async def admin_products_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+    ])
+    await callback.message.edit_text("📦 Управление товарами:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_product")
+async def admin_add_product_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text("Введите название товара:")
+    await state.set_state(AdminProductForm.waiting_for_name)
+    await callback.answer()
+
+@dp.message(AdminProductForm.waiting_for_name)
+async def admin_add_product_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("Введите цену (только число):")
+    await state.set_state(AdminProductForm.waiting_for_price)
+
+@dp.message(AdminProductForm.waiting_for_price)
+async def admin_add_product_price(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Введите число без букв.")
+        return
+    price = int(message.text)
+    data = await state.get_data()
+    if "edit_product_id" in data:
+        # Редактирование цены
+        product_id = data["edit_product_id"]
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE products SET price = $1 WHERE id = $2", price, product_id)
+        await refresh_cache()
+        await message.answer("✅ Цена обновлена!")
+        await state.clear()
+        # Показываем меню товаров
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+            [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+        ])
+        await message.answer("📦 Управление товарами:", reply_markup=kb)
+    else:
+        # Добавление нового товара
+        await state.update_data(price=price)
+        await message.answer("Введите категорию (розы, тюльпаны, сборные):")
+        await state.set_state(AdminProductForm.waiting_for_category)
+
+@dp.message(AdminProductForm.waiting_for_category)
+async def admin_add_product_category(message: Message, state: FSMContext):
+    await state.update_data(category=message.text.strip())
+    await message.answer("Введите ссылку на фото (можно просто пропустить, введите 'нет'):")
+    await state.set_state(AdminProductForm.waiting_for_photo)
+
+@dp.message(AdminProductForm.waiting_for_photo)
+async def admin_add_product_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photo = message.text.strip() if message.text.strip().lower() != "нет" else None
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO products (name, price, category, photo) VALUES ($1, $2, $3, $4)",
+            data["name"], data["price"], data["category"], photo
+        )
+    await refresh_cache()
+    await message.answer(f"✅ Товар «{data['name']}» добавлен!")
+    await state.clear()
+    # Показываем меню товаров
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+    ])
+    await message.answer("📦 Управление товарами:", reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_del_product")
+async def admin_del_product_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    if not product_cache:
+        await callback.message.edit_text("Товаров нет.", reply_markup=back_kb())
+        await callback.answer()
+        return
+    text = "Выберите товар для удаления:\n"
+    buttons = []
+    for pid, p in product_cache.items():
+        buttons.append([InlineKeyboardButton(text=f"🗑️ {p['name']}", callback_data=f"del_product_{pid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_products")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("del_product_"))
+async def admin_del_product_confirm(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    product_id = int(callback.data.split("_")[2])
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM products WHERE id = $1", product_id)
+    await refresh_cache()
+    await callback.answer("✅ Товар удалён", show_alert=True)
+    await admin_products_menu(callback)
+
+@dp.callback_query(F.data == "admin_edit_price")
+async def admin_edit_price_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    if not product_cache:
+        await callback.message.edit_text("Товаров нет.", reply_markup=back_kb())
+        await callback.answer()
+        return
+    text = "Выберите товар для изменения цены:\n"
+    buttons = []
+    for pid, p in product_cache.items():
+        buttons.append([InlineKeyboardButton(text=f"✏️ {p['name']} ({p['price']} руб.)", callback_data=f"edit_price_{pid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_products")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_price_"))
+async def admin_edit_price_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    product_id = int(callback.data.split("_")[2])
+    await state.update_data(edit_product_id=product_id)
+    await callback.message.edit_text("Введите новую цену (только число):")
+    await state.set_state(AdminProductForm.waiting_for_price)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    async with db_pool.acquire() as conn:
+        total_orders = await conn.fetchval("SELECT COUNT(*) FROM orders")
+        total_revenue = await conn.fetchval("SELECT COALESCE(SUM(total), 0) FROM orders WHERE status != 'отменён'")
+        new_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'новый'")
+    text = f"📊 Статистика:\n\n• Всего заказов: {total_orders}\n• Выручка: {total_revenue} руб.\n• Новых заказов: {new_orders}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text("👋 Админ-панель:", reply_markup=admin_keyboard())
+    await callback.answer()
+
 # ---------- Запуск ----------
 async def main():
     await init_db()
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
