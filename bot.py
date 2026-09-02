@@ -213,7 +213,7 @@ async def send_product_card(chat_id, product, edit=False, message_id=None):
     else:
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
 
-# ---------- Отправка списка товаров (новая функция) ----------
+# ---------- Отправка списка товаров ----------
 async def send_products_list(chat_id, category, edit_message=None):
     products = [p for p in product_cache.values() if p["category"] == category]
     if not products:
@@ -275,9 +275,7 @@ async def view_product(callback: CallbackQuery):
 async def back_to_category(callback: CallbackQuery):
     try:
         category = callback.data.split("_")[3]
-        # Удаляем сообщение карточки
         await callback.message.delete()
-        # Отправляем новый список
         await send_products_list(callback.message.chat.id, category)
         await callback.answer()
     except Exception as e:
@@ -487,7 +485,7 @@ async def admin_set_status(callback: CallbackQuery):
     await callback.answer(f"✅ Статус заказа #{order_id} изменён на «{new_status}»", show_alert=True)
     await admin_show_orders(callback)
 
-# ---------- Управление товарами ----------
+# ---------- Управление товарами (исправленное) ----------
 @dp.callback_query(F.data == "admin_products")
 async def admin_products_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -499,7 +497,10 @@ async def admin_products_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
     ])
-    await callback.message.edit_text("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
+    try:
+        await callback.message.edit_text("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_add_product")
@@ -531,7 +532,6 @@ async def admin_add_product_price(message: Message, state: FSMContext):
         await refresh_cache()
         await message.answer("✅ Цена обновлена!")
         await state.clear()
-        # Возвращаем в меню товаров
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
             [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
@@ -621,8 +621,16 @@ async def admin_del_product_confirm(callback: CallbackQuery):
         await refresh_cache()
         await callback.answer("✅ Товар удалён!", show_alert=True)
 
-        # Возвращаемся в меню управления товарами (редактируем текущее сообщение)
-        await admin_products_menu(callback)
+        # Удаляем текущее сообщение со списком товаров
+        await callback.message.delete()
+        # Отправляем новое сообщение с меню управления товарами
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+            [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+        ])
+        await bot.send_message(callback.from_user.id, "📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
         logger.error(f"Ошибка удаления товара: {e}", exc_info=True)
         await callback.answer("⚠️ Ошибка при удалении", show_alert=True)
