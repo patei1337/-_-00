@@ -16,11 +16,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения")
+    raise ValueError("BOT_TOKEN не задан")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL не задан в переменных окружения")
+    raise ValueError("DATABASE_URL не задан")
 if not ADMIN_ID:
-    raise ValueError("ADMIN_ID не задан в переменных окружения")
+    raise ValueError("ADMIN_ID не задан")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,7 +181,7 @@ def confirm_keyboard():
         [InlineKeyboardButton(text="❌ Нет", callback_data="broadcast_no")],
     ])
 
-# ---------- Карточка товара (с фото или без) ----------
+# ---------- Карточка товара ----------
 async def send_product_card(chat_id, product, edit=False, message_id=None):
     text = (
         f"🌸 *{product['name']}*\n"
@@ -224,7 +224,6 @@ async def start_handler(message: Message):
         parse_mode="Markdown"
     )
 
-# Показываем список товаров в категории
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_products_list(callback: CallbackQuery):
     try:
@@ -245,7 +244,6 @@ async def show_products_list(callback: CallbackQuery):
         logger.error("Ошибка списка категории: %s", e)
         await callback.answer("⚠️ Ошибка", show_alert=True)
 
-# Просмотр конкретного товара
 @dp.callback_query(F.data.startswith("view_"))
 async def view_product(callback: CallbackQuery):
     try:
@@ -261,12 +259,11 @@ async def view_product(callback: CallbackQuery):
         logger.error("Ошибка просмотра товара: %s", e)
         await callback.answer("⚠️ Ошибка", show_alert=True)
 
-# Возврат к списку категории
 @dp.callback_query(F.data.startswith("back_to_category_"))
 async def back_to_category(callback: CallbackQuery):
     try:
-        category = callback.data.split("_")[3]  # back_to_category_розы
-        await show_products_list(callback)  # переиспользуем логику показа списка
+        category = callback.data.split("_")[3]
+        await show_products_list(callback)
     except Exception as e:
         logger.error("Ошибка возврата к категории: %s", e)
         await callback.answer("⚠️ Ошибка", show_alert=True)
@@ -474,7 +471,7 @@ async def admin_set_status(callback: CallbackQuery):
     await callback.answer(f"✅ Статус заказа #{order_id} изменён на «{new_status}»", show_alert=True)
     await admin_show_orders(callback)
 
-# ---------- Управление товарами ----------
+# ---------- Управление товарами (исправленное удаление) ----------
 @dp.callback_query(F.data == "admin_products")
 async def admin_products_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -549,8 +546,9 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     await refresh_cache()
     await message.answer(f"✅ Товар «{data['name']}» добавлен!")
     await state.clear()
-    await admin_products_menu(message)  # возврат в меню товаров
+    await admin_products_menu(message)
 
+# ---------- Удаление товара (исправленное) ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -573,13 +571,26 @@ async def admin_del_product_confirm(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    product_id = int(callback.data.split("_")[2])
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM products WHERE id = $1", product_id)
-    await refresh_cache()
-    await callback.answer("✅ Товар удалён", show_alert=True)
-    await admin_products_menu(callback)
+    try:
+        # Извлекаем ID из callback_data
+        product_id = int(callback.data.split("_")[2])
+        # Проверяем, существует ли товар в кэше
+        if product_id not in product_cache:
+            await callback.answer("❌ Товар уже удалён или не найден", show_alert=True)
+            return
+        # Удаляем из базы
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM products WHERE id = $1", product_id)
+        # Обновляем кэш
+        await refresh_cache()
+        await callback.answer("✅ Товар удалён!", show_alert=True)
+        # Возвращаемся в список товаров
+        await admin_products_menu(callback)
+    except Exception as e:
+        logger.error("Ошибка удаления товара: %s", e)
+        await callback.answer("⚠️ Ошибка при удалении", show_alert=True)
 
+# ---------- Изменение цены (без изменений, но оставим) ----------
 @dp.callback_query(F.data == "admin_edit_price")
 async def admin_edit_price_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
