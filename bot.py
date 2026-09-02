@@ -515,7 +515,14 @@ async def admin_add_product_price(message: Message, state: FSMContext):
         await refresh_cache()
         await message.answer("✅ Цена обновлена!")
         await state.clear()
-        await admin_products_menu(message)
+        # Возвращаем в меню товаров (отправляем новое сообщение)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+            [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+        ])
+        await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
     else:
         await state.update_data(price=price)
         await message.answer("Введите категорию (розы, тюльпаны, сборные):")
@@ -546,7 +553,14 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     await refresh_cache()
     await message.answer(f"✅ Товар «{data['name']}» добавлен!")
     await state.clear()
-    await admin_products_menu(message)
+    # Возвращаем в меню товаров (отправляем новое сообщение)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")],
+    ])
+    await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
 # ---------- Удаление товара (исправленное) ----------
 @dp.callback_query(F.data == "admin_del_product")
@@ -572,25 +586,31 @@ async def admin_del_product_confirm(callback: CallbackQuery):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     try:
-        # Извлекаем ID из callback_data
-        product_id = int(callback.data.split("_")[2])
-        # Проверяем, существует ли товар в кэше
-        if product_id not in product_cache:
-            await callback.answer("❌ Товар уже удалён или не найден", show_alert=True)
+        parts = callback.data.split("_")
+        if len(parts) < 3:
+            await callback.answer("❌ Неверный формат", show_alert=True)
             return
-        # Удаляем из базы
+        product_id_str = parts[2]
+        if not product_id_str.isdigit():
+            await callback.answer("❌ Неверный ID", show_alert=True)
+            return
+        product_id = int(product_id_str)
+        
+        if product_id not in product_cache:
+            await callback.answer("❌ Товар не найден", show_alert=True)
+            return
+        
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM products WHERE id = $1", product_id)
-        # Обновляем кэш
+        
         await refresh_cache()
         await callback.answer("✅ Товар удалён!", show_alert=True)
-        # Возвращаемся в список товаров
-        await admin_products_menu(callback)
+        await admin_products_menu(callback)  # обновляем список
     except Exception as e:
-        logger.error("Ошибка удаления товара: %s", e)
+        logger.error(f"Ошибка удаления товара: {e}", exc_info=True)
         await callback.answer("⚠️ Ошибка при удалении", show_alert=True)
 
-# ---------- Изменение цены (без изменений, но оставим) ----------
+# ---------- Изменение цены ----------
 @dp.callback_query(F.data == "admin_edit_price")
 async def admin_edit_price_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
