@@ -350,11 +350,9 @@ async def decrease_cart(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("del_"))
 async def remove_item(callback: CallbackQuery):
     try:
-        # Проверяем, что это именно формат del_число (корзина)
         parts = callback.data.split("_")
         if len(parts) != 2 or not parts[1].isdigit():
-            # Если это не del_число, игнорируем (это может быть del_prod_..., который обработает другой хендлер)
-            return
+            return  # игнорируем другие callback'и
         product_id = parts[1]
         user_id = callback.from_user.id
         await update_cart(user_id, int(product_id), None)
@@ -490,7 +488,7 @@ async def admin_set_status(callback: CallbackQuery):
     await callback.answer(f"✅ Статус заказа #{order_id} изменён на «{new_status}»", show_alert=True)
     await admin_show_orders(callback)
 
-# ---------- Управление товарами (исправленное) ----------
+# ---------- Управление товарами ----------
 @dp.callback_query(F.data == "admin_products")
 async def admin_products_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -582,7 +580,7 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     ])
     await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# ---------- Удаление товара (исправленное, теперь используем del_prod_) ----------
+# ---------- Удаление товара (исправленное с логами) ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -602,11 +600,14 @@ async def admin_del_product_list(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_prod_"))
 async def admin_del_product_confirm(callback: CallbackQuery):
+    logger.info(f"Получен callback: {callback.data} от пользователя {callback.from_user.id}")
     if callback.from_user.id != ADMIN_ID:
+        logger.warning(f"Доступ запрещён для {callback.from_user.id}")
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     try:
         parts = callback.data.split("_")
+        logger.info(f"Разбивка: {parts}")
         if len(parts) < 3:
             await callback.answer("❌ Неверный формат", show_alert=True)
             return
@@ -615,6 +616,7 @@ async def admin_del_product_confirm(callback: CallbackQuery):
             await callback.answer("❌ Неверный ID", show_alert=True)
             return
         product_id = int(product_id_str)
+        logger.info(f"Попытка удалить товар с ID: {product_id}")
 
         if product_id not in product_cache:
             await callback.answer("❌ Товар не найден", show_alert=True)
@@ -624,6 +626,7 @@ async def admin_del_product_confirm(callback: CallbackQuery):
             await conn.execute("DELETE FROM products WHERE id = $1", product_id)
 
         await refresh_cache()
+        logger.info(f"Товар {product_id} удалён")
         await callback.answer("✅ Товар удалён!", show_alert=True)
 
         # Удаляем текущее сообщение со списком товаров
