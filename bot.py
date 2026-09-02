@@ -165,6 +165,7 @@ def main_menu_kb():
         [InlineKeyboardButton(text="🌷 Тюльпаны", callback_data="cat_тюльпаны")],
         [InlineKeyboardButton(text="💐 Сборные", callback_data="cat_сборные")],
         [InlineKeyboardButton(text="🛒 Корзина", callback_data="show_cart")],
+        [InlineKeyboardButton(text="📋 Мои заказы", callback_data="my_orders")],  # НОВАЯ КНОПКА
     ])
 
 def back_kb():
@@ -459,6 +460,49 @@ async def back_to_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
+# ---------- ИСТОРИЯ ЗАКАЗОВ ДЛЯ ПОЛЬЗОВАТЕЛЯ ----------
+@dp.message(Command("myorders"))
+async def my_orders_command(message: Message):
+    user_id = message.from_user.id
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, total, status, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
+            user_id
+        )
+    if not rows:
+        await message.answer("📭 У вас пока нет заказов.")
+        return
+    text = "📋 *Ваши заказы:*\n\n"
+    for row in rows:
+        status_emoji = {"новый": "🆕", "в работе": "🔄", "доставлен": "✅", "отменён": "❌"}.get(row['status'], "❓")
+        text += f"#{row['id']}  {status_emoji} {row['status']}  {row['created_at'].strftime('%d.%m %H:%M')}  {row['total']} руб.\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")]
+    ])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data == "my_orders")
+async def my_orders_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, total, status, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
+            user_id
+        )
+    if not rows:
+        await callback.message.edit_text("📭 У вас пока нет заказов.", reply_markup=back_kb())
+        await callback.answer()
+        return
+    text = "📋 *Ваши заказы:*\n\n"
+    for row in rows:
+        status_emoji = {"новый": "🆕", "в работе": "🔄", "доставлен": "✅", "отменён": "❌"}.get(row['status'], "❓")
+        text += f"#{row['id']}  {status_emoji} {row['status']}  {row['created_at'].strftime('%d.%m %H:%M')}  {row['total']} руб.\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer()
+
 # ---------- Админка ----------
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
@@ -702,7 +746,7 @@ async def admin_stats(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_kb())
     await callback.answer()
 
-# ---------- ОТЧЁТЫ (ИСПРАВЛЕННЫЕ) ----------
+# ---------- ОТЧЁТЫ ----------
 @dp.callback_query(F.data == "admin_reports")
 async def admin_reports_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -814,7 +858,6 @@ async def report_custom_get_end(message: Message, state: FSMContext):
         if start_date > end_date:
             await message.answer("❌ Дата начала не может быть позже даты окончания.")
             return
-        # Создаём фиктивный callback-объект
         class DummyCallback:
             def __init__(self, msg, user_id):
                 self.message = msg
