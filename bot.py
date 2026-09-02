@@ -350,10 +350,8 @@ async def decrease_cart(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("del_"))
 async def remove_item(callback: CallbackQuery):
     try:
-        # Удаление из корзины только если формат del_число
         parts = callback.data.split("_")
         if len(parts) != 2 or not parts[1].isdigit():
-            # игнорируем другие callback'и (например, rmprod_...)
             return
         product_id = parts[1]
         user_id = callback.from_user.id
@@ -582,7 +580,7 @@ async def admin_add_product_description(message: Message, state: FSMContext):
     ])
     await message.answer("📦 *Управление товарами:*", parse_mode="Markdown", reply_markup=kb)
 
-# ---------- Удаление товара (исправлено: префикс rmprod_) ----------
+# ---------- Удаление товара (исправлено: проверка по строковому ключу) ----------
 @dp.callback_query(F.data == "admin_del_product")
 async def admin_del_product_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -617,12 +615,12 @@ async def admin_del_product_confirm(callback: CallbackQuery):
         if not product_id_str.isdigit():
             await callback.answer("❌ Неверный ID", show_alert=True)
             return
-        product_id = int(product_id_str)
-        logger.info(f"Попытка удалить товар с ID: {product_id}")
-
-        if product_id not in product_cache:
+        # Проверяем наличие в кэше по строковому ключу
+        if product_id_str not in product_cache:
             await callback.answer("❌ Товар не найден", show_alert=True)
             return
+        product_id = int(product_id_str)
+        logger.info(f"Попытка удалить товар с ID: {product_id}")
 
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM products WHERE id = $1", product_id)
