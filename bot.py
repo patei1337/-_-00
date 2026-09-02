@@ -68,7 +68,6 @@ async def init_db():
                 category TEXT NOT NULL
             )
         ''')
-        # Добавляем столбец description, если его нет
         await conn.execute('''
             ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT DEFAULT 'Отличный выбор!'
         ''')
@@ -127,15 +126,16 @@ async def refresh_cache():
     global product_cache
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, name, price, photo, category, description FROM products")
-        product_cache = {
-            str(row["id"]): {
+        product_cache = {}
+        for row in rows:
+            product_cache[str(row["id"])] = {
+                "id": str(row["id"]),  # добавляем id внутрь
                 "name": row["name"],
                 "price": row["price"],
                 "photo": row["photo"],
                 "category": row["category"],
                 "description": row["description"]
-            } for row in rows
-        }
+            }
     logger.info("Кэш товаров обновлён, %d записей", len(product_cache))
 
 # ---------- Работа с корзиной и пользователями ----------
@@ -251,16 +251,15 @@ async def start_handler(message: Message):
 async def show_products(callback: CallbackQuery):
     try:
         category = callback.data.split("_")[1]
+        # Получаем список товаров категории
         products = [p for p in product_cache.values() if p["category"] == category]
         if not products:
             await callback.message.edit_text("В этой категории пока нет товаров.", reply_markup=back_kb())
             await callback.answer()
             return
-        # Берём первый товар категории (можно доработать пагинацию)
+        # Берём первый товар
         product = products[0]
-        # Находим его ID
-        pid = [k for k, v in product_cache.items() if v['name'] == product['name'] and v['category'] == product['category']][0]
-        product['id'] = pid
+        # Убедимся, что у товара есть id (он уже добавлен в кэш)
         await send_product_card(callback.message.chat.id, product)
         await callback.message.delete()
         await callback.answer()
