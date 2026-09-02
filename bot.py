@@ -74,10 +74,23 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Если таблица уже существовала без status — добавляем
+        # Добавляем статус, если его нет
         await conn.execute('''
             ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'новый'
         ''')
+
+        # ----- НОВАЯ ТАБЛИЦА ДЛЯ ПОЛЬЗОВАТЕЛЕЙ -----
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Заполняем таблицу пользователей из существующих заказов (если пуста)
+        count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        if count == 0:
+            await conn.execute("INSERT INTO users (user_id) SELECT DISTINCT user_id FROM orders ON CONFLICT (user_id) DO NOTHING")
 
         # Заполняем тестовыми товарами, если пусто
         count = await conn.fetchval("SELECT COUNT(*) FROM products")
@@ -126,10 +139,22 @@ async def clear_cart(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM carts WHERE user_id = $1", user_id)
 
+# ---------- Сохранение пользователя ----------
+async def save_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id
+        )
+
 # ---------- FSM для заказа ----------
 class OrderForm(StatesGroup):
     address = State()
     phone = State()
+
+# ---------- FSM для рассылки ----------
+class BroadcastForm(StatesGroup):
+    waiting_for_confirm = State()
 
 # ---------- FSM для управления товарами ----------
 class AdminProductForm(StatesGroup):
@@ -164,11 +189,20 @@ def admin_keyboard():
         [InlineKeyboardButton(text="📋 Заказы", callback_data="admin_orders")],
         [InlineKeyboardButton(text="📦 Товары", callback_data="admin_products")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],  # Новая кнопка
+    ])
+
+def confirm_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, отправить", callback_data="broadcast_yes")],
+        [InlineKeyboardButton(text="❌ Нет, отменить", callback_data="broadcast_no")],
     ])
 
 # ---------- Обработчики пользователей ----------
 @dp.message(Command("start"))
 async def start_handler(message: Message):
+    # Сохраняем пользователя
+    await save_user(message.from_user.id)
     await message.answer("🌹 Добро пожаловать в цветочный магазин!", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data.startswith("cat_"))
@@ -313,9 +347,15 @@ async def get_phone(message: Message, state: FSMContext):
     order_text = f"🆕 Новый заказ!\nАдрес: {address}\nТелефон: {phone}\n\n" + "\n".join(order_lines) + f"\nИтого: {total} руб."
 
     async with db_pool.acquire() as conn:
+        # Сохраняем заказ
         await conn.execute(
             "INSERT INTO orders (user_id, address, phone, total, status) VALUES ($1, $2, $3, $4, $5)",
             user_id, address, phone, total, 'новый'
+        )
+        # Сохраняем пользователя (если его ещё нет)
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id
         )
 
     await bot.send_message(ADMIN_ID, order_text)
@@ -416,14 +456,12 @@ async def admin_add_product_price(message: Message, state: FSMContext):
     price = int(message.text)
     data = await state.get_data()
     if "edit_product_id" in data:
-        # Редактирование цены
         product_id = data["edit_product_id"]
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE products SET price = $1 WHERE id = $2", price, product_id)
         await refresh_cache()
         await message.answer("✅ Цена обновлена!")
         await state.clear()
-        # Показываем меню товаров
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
             [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
@@ -432,7 +470,6 @@ async def admin_add_product_price(message: Message, state: FSMContext):
         ])
         await message.answer("📦 Управление товарами:", reply_markup=kb)
     else:
-        # Добавление нового товара
         await state.update_data(price=price)
         await message.answer("Введите категорию (розы, тюльпаны, сборные):")
         await state.set_state(AdminProductForm.waiting_for_category)
@@ -455,7 +492,6 @@ async def admin_add_product_photo(message: Message, state: FSMContext):
     await refresh_cache()
     await message.answer(f"✅ Товар «{data['name']}» добавлен!")
     await state.clear()
-    # Показываем меню товаров
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
         [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_del_product")],
@@ -530,13 +566,108 @@ async def admin_stats(callback: CallbackQuery):
         total_orders = await conn.fetchval("SELECT COUNT(*) FROM orders")
         total_revenue = await conn.fetchval("SELECT COALESCE(SUM(total), 0) FROM orders WHERE status != 'отменён'")
         new_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'новый'")
-    text = f"📊 Статистика:\n\n• Всего заказов: {total_orders}\n• Выручка: {total_revenue} руб.\n• Новых заказов: {new_orders}"
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+    text = f"📊 Статистика:\n\n• Всего заказов: {total_orders}\n• Выручка: {total_revenue} руб.\n• Новых заказов: {new_orders}\n• Всего пользователей: {total_users}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")]
     ])
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
+# ---------- НОВЫЙ РАЗДЕЛ: РАССЫЛКА ----------
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📢 Введите текст сообщения для рассылки.\n\n"
+        "Он будет отправлен **всем** пользователям, которые когда-либо общались с ботом.\n"
+        "Для отмены отправьте /cancel"
+    )
+    await state.set_state(BroadcastForm.waiting_for_confirm)
+    await state.update_data(broadcast_text=None)  # Очищаем предыдущее
+    await callback.answer()
+
+# Обработчик текста для рассылки (принимаем текст)
+@dp.message(BroadcastForm.waiting_for_confirm)
+async def broadcast_get_text(message: Message, state: FSMContext):
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Рассылка отменена.")
+        await admin_panel(message)  # возвращаем в админку
+        return
+    # Сохраняем текст и просим подтверждение
+    await state.update_data(broadcast_text=message.text)
+    kb = confirm_keyboard()
+    await message.answer(
+        f"📢 Вы хотите отправить следующее сообщение ВСЕМ пользователям?\n\n"
+        f"«{message.text}»\n\n"
+        f"Подтвердите действие:",
+        reply_markup=kb
+    )
+
+# Обработчик кнопки "Да"
+@dp.callback_query(F.data == "broadcast_yes")
+async def broadcast_confirm_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get("broadcast_text")
+    if not text:
+        await callback.answer("❌ Текст не найден. Начните заново.", show_alert=True)
+        await state.clear()
+        await admin_panel(callback.message)
+        return
+
+    # Получаем всех пользователей
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+    user_ids = [row["user_id"] for row in rows]
+
+    if not user_ids:
+        await callback.message.edit_text("❌ Нет пользователей для рассылки.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    # Отправляем уведомление, что процесс начался
+    await callback.message.edit_text(f"⏳ Начинаю рассылку для {len(user_ids)} пользователей...")
+
+    # Отправляем сообщение каждому
+    sent = 0
+    failed = 0
+    for i, uid in enumerate(user_ids):
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception as e:
+            logger.error(f"Не удалось отправить пользователю {uid}: {e}")
+            failed += 1
+        # Задержка, чтобы не превысить лимиты Telegram (30 сообщений/сек)
+        if i % 30 == 0:
+            await asyncio.sleep(1)  # пауза каждые 30 сообщений
+
+    await callback.message.edit_text(
+        f"✅ Рассылка завершена!\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
+    await state.clear()
+
+# Обработчик кнопки "Нет"
+@dp.callback_query(F.data == "broadcast_no")
+async def broadcast_confirm_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text("❌ Рассылка отменена.")
+    await state.clear()
+    await admin_panel(callback.message)  # возвращаем в админку
+    await callback.answer()
+
+# Возврат в админку из любого места
 @dp.callback_query(F.data == "back_to_admin")
 async def back_to_admin(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
